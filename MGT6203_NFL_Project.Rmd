@@ -1,0 +1,189 @@
+---
+title: "MGT6203 NFL Regression Project"
+author: "Joanna Rashid"
+date: "4/3/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Team Members
+
+- Christopher Hom
+- Lili Teister
+- Joanna Rashid
+- Stephen Yu
+
+# Required Packages
+```{r}
+#install.packages("devtools")
+#devtools::install_github(repo = "maksimhorowitz/nflscrapR")
+#install.packages("nflreadr")
+
+#library(nflscrapR) !!Lili, I could not get this package to load!!
+library(dplyr)
+library(nflreadr)
+library(tidyverse)
+library(lubridate)
+library(SmartEDA)
+library(corrplot)
+library(ggcorrplot)
+```
+
+## Load games dataset
+
+The games dataset is the main dataset that will be used for analysis. It contains a row for each NFL games from 1999 to 2021, but only seasons from 2010 will be included in the analysis.
+
+```{r}
+games_raw <- read.csv("http://www.habitatring.com/games.csv") %>%
+  filter(season > 2009)
+
+head(games_raw)
+```
+First, various attributes were selected to use as potential predicting or response variables.
+One of those variables is moneyline, a betting wager, which can be converted with the following formula into the win probability based on bets placed before the game
+
+```{r}
+
+moneyline_to_odds_for <- function(ml){
+  ifelse(ml < 0, (0-ml) / (0-ml+100), 100/(ml+100))
+}
+
+```
+
+```{r}
+games_select <- games_raw %>%
+  mutate(home_prob = moneyline_to_odds_for(home_moneyline)) %>%
+  select(game_id, # identifier for the game
+         season, # year of season start
+         game_type, # regular season, playoff game, etc
+         week, # week number during the season
+         gameday, # date of game
+         weekday, # day of the week of the game, usually Sunday, Monday, or Thursday
+         gametime, # time of the start of the game, eastern time
+         away_team, # abbreviation for the away team
+         home_team, # abbreviation for the home team
+         home_score, # final score for the home team
+         away_score, # final score for the away team
+         location, # Home if the game was played at the home team's stadium, Neutral if in a neutral location
+         result, # home team score - away team score
+         total, # total points scored 
+         overtime, # indicator for if the game went into OT
+         home_rest, # number of days of rest the home team had since last game
+         away_rest, # number of days of rest the away team had since last game
+         home_moneyline, # used to calculate win prob for home team
+         home_prob, # estimated win probability for the home team 
+         total_line, # expected total points
+         div_game, # indicator for if the teams playing each other are in the same division. A more consequential game for standings.
+         roof, # type of stadium roof, such as dome, closed, or outdoors.
+         surface, # type of grass on the field
+         temp, # outside temp if the stadium is outdoors 
+         wind # speed of wind if the stadium is outdoors
+         )
+
+
+```
+
+Additionally, more information can be added to supplement the existing game information. 
+One feature to add is how many injured players a team had during a game. However, injuries need to be combined with some sort of data on player value, since it really only matters if important players are injured. The simplest data I could find was rosters, which contains a player's approximate value for that year. 
+
+```{r}
+injuries <- load_injuries(c(2010:2019)) %>%
+  mutate(season = as.integer(season))
+
+head(injuries)
+
+rosters <- read.csv("https://raw.githubusercontent.com/leesharpe/nfldata/master/data/rosters.csv") %>%
+  filter(season > 2009)
+
+
+injuries_roster <- injuries %>%
+  left_join(rosters, by=c("season"="season", "team"="team", "full_name"="full_name")) %>%
+  select(season,
+         week,
+         team,
+         full_name,  # injured player full name
+         report_status, # player's status on the official injury report
+         games, # from rosters, number of games played total during that season for that team
+         starts, # from rosters, number of total starts during that season for that team
+         years, # from rosters, number of years player has been in the NFL
+         av # from rosters, the player's Approximate Value for that year as defined by the Pro Football Reference metric
+         )
+```
+
+## EDA
+```{r}
+games_select$game_type <- as.factor(games_select$game_type)
+
+games_select$gameday <- as.Date(games_select$gameday)
+
+games_select$weekday <- as.factor(games_select$weekday)
+
+games_select$location <- as.factor(games_select$location)
+
+games_select$roof <- as.factor(games_select$roof)
+
+games_select$surface <- as.factor(games_select$surface)
+
+#adds a binary variable for home team win or lose for logistic regression
+games_select$win_lose <- ifelse(games_select$result > 0, 1 , 0)
+
+#rest difference (home rest - away rest)
+games_select$rest_diff <- (games_select$home_rest - games_select$away_rest)
+```
+
+```{r}
+ExpData(data=games_select,type=2, fun = c("mean", "median", "var"))
+```
+
+```{r}
+#numeric vars
+
+numeric_data <- games_select %>% select(result, week, away_score, home_score, overtime, home_rest, away_rest, temp, wind, home_moneyline, home_prob, total_line, win_lose, rest_diff)
+
+ExpNumViz(numeric_data,target="result",scatter=FALSE,fname=NULL,col="blue")
+```
+```{r}
+#Correlation for numeric vars
+
+numeric_corr <- cor(numeric_data)
+corrplot(numeric_corr)
+```
+
+```{r}
+#factors vars
+
+factor_data <- games_select %>% select(game_type, weekday, location, overtime, roof, surface, win_lose)
+
+factor_data$overtime <- as.factor(factor_data$overtime)
+factor_data$win_lose <- as.factor(factor_data$win_lose)
+
+ExpCatViz(factor_data,target=NULL,col ="slateblue4",clim=10,margin=2)
+```
+
+```{r}
+#Correlation for factor vars
+
+model.matrix(~0+., data=factor_data) %>% 
+  cor(use="pairwise.complete.obs") %>% 
+  ggcorrplot(show.diag = F, type="lower", lab=TRUE, lab_size=2)
+
+```
+
+## Initial Regression
+
+```{r}
+#initial linear model 
+
+lm_initial <- lm(result ~ game_type + week + weekday + location + overtime + rest_diff, data = games_select)
+summary(lm_initial)
+
+#regressing only location on result
+lm_home <- lm(result ~ location, data = games_select)
+summary(lm_home)
+
+log_home <- glm(win_lose ~ location, data = games_select, family = binomial(link = 'logit'))
+summary(log_home)
+```
